@@ -33,7 +33,7 @@ class VariableResolver:
 
             self.variables[name] = value
 
-        return self.variables
+        return self.variables 
 
     def resolve(self, expression: str):
         """
