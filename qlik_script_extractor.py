@@ -9,8 +9,32 @@ class QlikScriptExtractor:
 
     @staticmethod
     def clean_script(script: str):
-         """Supprime les commentaires de ligne et les commentaires // en fin de ligne."""
-         return re.sub(r"(?m)^\s*//[^\n]*$", "", script)
+        """Masque les commentaires en préservant les chaînes et les positions."""
+        pattern = r"'[^'\r\n]*(?:''[^'\r\n]*)*'|\"[^\"\r\n]*(?:\"\"[^\"\r\n]*)*\"|\[[^\]\r\n]*\]|//[^\r\n]*|/\*[\s\S]*?\*/"
+        return re.sub(
+            pattern,
+            lambda m: re.sub(r"[^\r\n]", " ", m.group())
+            if m.group().startswith(("//", "/*")) else m.group(),
+            script,
+        )
+
+    @staticmethod
+    def extract_where(statement: str):
+        """Renvoie la condition WHERE externe, sans les clauses SQL suivantes."""
+        tokens = r"'[^']*(?:''[^']*)*'|\"[^\"]*(?:\"\"[^\"]*)*\"|\[[^\]]*\]|\(|\)|\bWHERE\b|\b(?:GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION)\b"
+        depth = 0
+        start = None
+        for match in re.finditer(tokens, statement, re.IGNORECASE):
+            token = match.group()
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth -= 1
+            elif depth == 0 and token.upper() == "WHERE" and start is None:
+                start = match.end()
+            elif depth == 0 and start is not None and token[0] not in "'\"[":
+                return statement[start:match.start()].strip()
+        return statement[start:].strip() if start is not None else None
     # def clean_script(script: str):
     #     """Supprime les commentaires // en préservant chaînes et chemins entre crochets."""
     #     pattern = r"'[^']*(?:''[^']*)*'|\"[^\"]*(?:\"\"[^\"]*)*\"|\[[^\]]*\]|//[^\r\n]*"
@@ -63,13 +87,14 @@ class QlikScriptExtractor:
         return script
 
     def extract_sql_sources(self, script: str):
+        script = self.clean_script(script)
         sources = []
 
         pattern = (
             r"(?im)^\s*"
-            r"(?:(\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
-            r"LOAD\b[^;]*;\s*"
-            r"SELECT\b(.*?);"
+            r"(?:(\$\([A-Za-z_]\w*\)|\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
+            r"LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*;\s*"
+            r"SELECT\b((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
         for match in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
@@ -77,7 +102,7 @@ class QlikScriptExtractor:
             sql_query = match.group(2)
 
             sql_tables = re.findall(
-                r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.~]*)",
+                r"\b(?:FROM|JOIN)\s+(\$\([A-Za-z_]\w*\)|[A-Za-z_][\w.~]*)",
                 sql_query,
                 flags=re.IGNORECASE
             )
@@ -91,12 +116,14 @@ class QlikScriptExtractor:
                 sources.append({
                     "table": table_name,
                     "source_type": "SQL",
-                    "source": self.resolver.resolve(source, match.start())
+                    "source": self.resolver.resolve(source, match.start()),
+                    "where": self._resolve_where(sql_query, match.start()),
                 })
 
         return sources
 
     def extract_file_sources(self, script: str):
+        script = self.clean_script(script)
         sources = []
 
         pattern = (
@@ -104,6 +131,7 @@ class QlikScriptExtractor:
             r"(?:(\$\([A-Za-z_]\w*\)|\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
             r"LOAD\b[^;]*?\bFROM\s+"
             r"(?:\[([^\]]+)\]|([^\s;()]+(?:\$\([A-Za-z_]\w*\)[^\s;()]*)*))"
+            r"((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
         for match in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
@@ -116,15 +144,50 @@ class QlikScriptExtractor:
             sources.append({
                 "table": table_name,
                 "source_type": "FILE",
-                "source": self.resolver.resolve(raw_path,match.start())
+                "source": self.resolver.resolve(raw_path,match.start()),
+                "where": self._resolve_where(match.group(4), match.start()),
             })
 
         return sources
 
+    def _resolve_where(self, statement, position):
+        condition = self.extract_where(statement)
+        return self.resolver.resolve(condition, position) if condition is not None else None
+
+    def extract_dynamic_store_templates(self, script):
+        """Repère les boucles FOR / TableName / STORE de toutes les tables."""
+        templates = []
+        pattern = (
+            r"\bFOR\s+\w+\s*=\s*0\s+TO\s+NoOfTables\(\)\s*-\s*1"
+            r"(?P<body>.*?)\bNEXT\b"
+        )
+        for loop in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
+            body = loop.group('body')
+            assignment = re.search(
+                r"\bLET\s+(\w+)\s*=\s*TableName\([^)]*\)\s*;",
+                body, re.IGNORECASE,
+            )
+            if not assignment:
+                continue
+            table_variable = '$(' + assignment.group(1) + ')'
+            store = re.search(
+                r"\bSTORE\s+" + re.escape(table_variable)
+                + r"\s+INTO\s+\[([^\]]+)\]\s*(?:\([^)]*\))?\s*;",
+                body, re.IGNORECASE,
+            )
+            if store:
+                templates.append({
+                    'variable': table_variable,
+                    'path': store.group(1),
+                    'position': loop.start('body') + store.start(),
+                })
+        return templates
 
     def build_table_inventory(self, script):
         inventory = {}
-        #script = self.clean_script(script)
+        # Le STORE global sert de modèle de sortie, même après EXIT SCRIPT.
+        full_script = self.clean_script(script)
+        templates = self.extract_dynamic_store_templates(full_script)
         script = self.get_executable_script(script)
 
         self.resolver.extract_set_variables(script)
@@ -144,7 +207,8 @@ class QlikScriptExtractor:
             )
             source_info = {
                 "type": source["source_type"],
-                "name": source["source"]
+                "name": source["source"],
+                "where": source["where"],
             }
 
             if source_info not in inventory[table_name]["sources"]:
@@ -154,6 +218,8 @@ class QlikScriptExtractor:
         for store in stores:
 
             table_name = store["table"]
+            if any(table_name == template['variable'] for template in templates):
+                continue
 
             inventory.setdefault(
                 table_name,
@@ -163,6 +229,16 @@ class QlikScriptExtractor:
             inventory[table_name]["outputs"].append(
                 store["output_file"]
             )
+
+        # 3. Compléter uniquement les tables sans sortie explicite.
+        for table_name, details in inventory.items():
+            if table_name is None or details['outputs']:
+                continue
+            for template in templates:
+                path = template['path'].replace(template['variable'], table_name)
+                path = self.resolver.resolve(path, template['position'])
+                if path not in details['outputs']:
+                    details['outputs'].append(path)
 
         return inventory
 
