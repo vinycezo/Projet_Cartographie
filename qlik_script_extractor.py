@@ -25,8 +25,6 @@ class QlikScriptExtractor:
     def extract_stores(self, script: str):
         stores = []
 
-        # Supprimer les commentaires de ligne entière
-        script = self.clean_script(script)
 
         pattern = (
             r"\bSTORE\s+"
@@ -42,8 +40,8 @@ class QlikScriptExtractor:
             raw_table = match.group(1).strip("[]")
             raw_path = match.group(2)
 
-            table_name = self.resolver.resolve(raw_table)
-            resolved_path = self.resolver.resolve(raw_path)
+            table_name = self.resolver.resolve(raw_table, match.start())
+            resolved_path = self.resolver.resolve(raw_path, match.start())
 
             stores.append({
                 "table": table_name,
@@ -52,9 +50,19 @@ class QlikScriptExtractor:
 
         return stores
 
+    def get_executable_script(self, script):
+        script = self.clean_script(script)
+
+        match = re.search(
+            r"(?im)^\s*EXIT\s+SCRIPT\s*;",
+            script
+        )
+
+        if match:
+            return script[:match.start()]
+        return script
 
     def extract_sql_sources(self, script: str):
-        script = self.clean_script(script)
         sources = []
 
         pattern = (
@@ -75,41 +83,40 @@ class QlikScriptExtractor:
             )
 
             if table_name:
-                table_name = self.resolver.resolve(table_name.strip("[]"))
+                table_name = self.resolver.resolve(table_name.strip("[]"), match.start())
             elif sql_tables:
-                table_name = self.resolver.resolve(sql_tables[0])    
+                table_name = self.resolver.resolve(sql_tables[0], match.start())    
 
             for source in sql_tables:
                 sources.append({
                     "table": table_name,
                     "source_type": "SQL",
-                    "source": self.resolver.resolve(source)
+                    "source": self.resolver.resolve(source, match.start())
                 })
 
         return sources
 
     def extract_file_sources(self, script: str):
-        script = self.clean_script(script)
         sources = []
 
         pattern = (
             r"(?im)^\s*"
-            r"(?:(\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
+            r"(?:(\$\([A-Za-z_]\w*\)|\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
             r"LOAD\b[^;]*?\bFROM\s+"
-            r"\[([^\]]+)\]"
+            r"(?:\[([^\]]+)\]|([^\s;()]+(?:\$\([A-Za-z_]\w*\)[^\s;()]*)*))"
         )
 
         for match in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
             table_name = match.group(1)
-            raw_path = match.group(2)
+            raw_path = match.group(2) or match.group(3)
 
             if table_name:
-                table_name = self.resolver.resolve(table_name.strip("[]"))
+                table_name = self.resolver.resolve(table_name.strip("[]"), match.start())
 
             sources.append({
                 "table": table_name,
                 "source_type": "FILE",
-                "source": self.resolver.resolve(raw_path)
+                "source": self.resolver.resolve(raw_path,match.start())
             })
 
         return sources
@@ -117,6 +124,10 @@ class QlikScriptExtractor:
 
     def build_table_inventory(self, script):
         inventory = {}
+        #script = self.clean_script(script)
+        script = self.get_executable_script(script)
+
+        self.resolver.extract_set_variables(script)
 
         sql_sources = self.extract_sql_sources(script)
         file_sources = self.extract_file_sources(script)

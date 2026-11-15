@@ -44,7 +44,7 @@ extractor = QlikScriptExtractor(resolver)
 #     print(source)
 
 inventory = extractor.build_table_inventory(script)
-pprint(inventory, sort_dicts=False)
+
 
 for table_name, details in inventory.items():
     print(f"\nTABLE : {table_name}")

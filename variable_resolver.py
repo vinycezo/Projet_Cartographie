@@ -13,6 +13,7 @@ class VariableResolver:
         Exemple :
         SET vChemin_extract='lib://Prod/Ppl/Commun';
         """
+        self.variables_history = {}
 
         # Supprime les commentaires de ligne entière
         script = re.sub(
@@ -31,11 +32,26 @@ class VariableResolver:
             if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
                 value = value[1:-1]
 
-            self.variables[name] = value
+            self.variables_history.setdefault(name, []).append({
+                "position":match.start(),
+                "value":value
+            })
 
-        return self.variables 
+        return self.variables_history
 
-    def resolve(self, expression: str):
+    def get_variable_at(self, name, position):
+        history = self.variables_history.get(name, [])
+
+        valid_values = [item for item in history if item['position'] < position]
+
+        if not valid_values:
+            return None
+
+        return valid_values[-1]["value"]
+
+     
+
+    def resolve(self, expression: str, position: int):
         """
         Remplace les références $(variable)
         par leur valeur connue.
@@ -46,10 +62,12 @@ class VariableResolver:
         def replace_variable(match):
             name = match.group(1)
 
-            return self.variables.get(
-                name,
-                match.group(0)
-            )
+            value = self.get_variable_at(name, position)
+
+            if value is None:
+                return match.group(0)
+
+            return value
 
         result = expression
 
