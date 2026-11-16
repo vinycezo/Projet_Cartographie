@@ -4,6 +4,9 @@ import re
 
 class QlikScriptExtractor:
 
+    # Les expansions peuvent faire partie d'un nom : temp_$(vTable).
+    IDENTIFIER = r'(?:\[[^\]]+\]|(?:\$\([A-Za-z_]\w*\)|[A-Za-z_])(?:\$\([A-Za-z_]\w*\)|[\w.~])*)'
+
     def __init__(self, resolver):
         self.resolver = resolver
 
@@ -92,9 +95,9 @@ class QlikScriptExtractor:
 
         pattern = (
             r"(?im)^\s*"
-            r"(?:(\$\([A-Za-z_]\w*\)|\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
-            r"LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*;\s*"
-            r"SELECT\b((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
+            rf"(?:({self.IDENTIFIER})\s*:\s*)?"
+            r"LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*?;?\s*"
+            r"(?:SQL\s+)?SELECT\b((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
         for match in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
@@ -102,7 +105,7 @@ class QlikScriptExtractor:
             sql_query = match.group(2)
 
             sql_tables = re.findall(
-                r"\b(?:FROM|JOIN)\s+(\$\([A-Za-z_]\w*\)|[A-Za-z_][\w.~]*)",
+                rf"\b(?:FROM|JOIN)\s+({self.IDENTIFIER})",
                 sql_query,
                 flags=re.IGNORECASE
             )
@@ -128,9 +131,9 @@ class QlikScriptExtractor:
 
         pattern = (
             r"(?im)^\s*"
-            r"(?:(\$\([A-Za-z_]\w*\)|\[[^\]]+\]|[A-Za-z_]\w*)\s*:\s*)?"
-            r"LOAD\b[^;]*?\bFROM\s+"
-            r"(?:\[([^\]]+)\]|([^\s;()]+(?:\$\([A-Za-z_]\w*\)[^\s;()]*)*))"
+            rf"(?:({self.IDENTIFIER})\s*:\s*)?"
+            r"LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|(?!(?:SQL\s+)?SELECT\b)[^;'\"])*?\bFROM\s+"
+            r"(?:\[([^\]]+)\]|((?:\$\([A-Za-z_]\w*\)|[^\s;()])+))"
             r"((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
@@ -153,6 +156,22 @@ class QlikScriptExtractor:
     def _resolve_where(self, statement, position):
         condition = self.extract_where(statement)
         return self.resolver.resolve(condition, position) if condition is not None else None
+
+    def extract_resident_sources(self, script):
+        """Extrait les liens entre tables chargées avec RESIDENT."""
+        pattern = (
+            rf"(?im)^\s*({self.IDENTIFIER})\s*:\s*LOAD\b"
+            r"(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*?"
+            rf"\bRESIDENT\s+({self.IDENTIFIER})"
+            r"((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
+        )
+        links = []
+        for match in re.finditer(pattern, self.clean_script(script), re.IGNORECASE):
+            links.append({
+                "table": self.resolver.resolve(match.group(1).strip("[]"), match.start()),
+                "resident": self.resolver.resolve(match.group(2).strip("[]"), match.start()),
+            })
+        return links
 
     def extract_dynamic_store_templates(self, script):
         """Repère les boucles FOR / TableName / STORE de toutes les tables."""
@@ -213,6 +232,14 @@ class QlikScriptExtractor:
 
             if source_info not in inventory[table_name]["sources"]:
                 inventory[table_name]["sources"].append(source_info)
+
+        # Propager les sources physiques à travers les chargements RESIDENT.
+        for link in self.extract_resident_sources(script):
+            details = inventory.setdefault(link['table'], {"sources": [], "outputs": []})
+            upstream = inventory.get(link['resident'], {}).get('sources', [])
+            for source in list(upstream):
+                if source not in details['sources']:
+                    details['sources'].append(source.copy())
 
         # 2. Ajouter les fichiers de sortie
         for store in stores:
