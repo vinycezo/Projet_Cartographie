@@ -49,13 +49,25 @@ class QlikScriptExtractor:
 
 
 
-    def extract_stores(self, script: str):
+    def _path_variables(self, expression, position, excluded=()):
+        variables = []
+        names = dict.fromkeys(re.findall(r"\$\(([A-Za-z_]\w*)\)", expression))
+        for name in names:
+            if name in excluded:
+                continue
+            value = self.resolver.get_variable_at(name, position)
+            if value is not None:
+                value = self.resolver.resolve(value, position)
+            variables.append((name, value))
+        return tuple(variables)
+
+    def extract_stores(self, script: str, *, include_variables=False):
         stores = []
 
 
         pattern = (
             r"\bSTORE\s+"
-            r"(\[[^\]]+\]|[^\s;]+)"
+            r"(?:[^;]+?\s+FROM\s+)?(\[[^\]]+\]|[^\s;]+)"
             r"\s+INTO\s+"
             r"\[([^\]]+)\]"
             r"\s*(?:\([^)]*\))?\s*;"
@@ -74,6 +86,9 @@ class QlikScriptExtractor:
                 "table": table_name,
                 "output_file": resolved_path
             })
+            if include_variables:
+                table_variables = re.findall(r"\$\(([A-Za-z_]\w*)\)", raw_table)
+                stores[-1]["variables"] = self._path_variables(raw_path, match.start(), table_variables)
 
         return stores
 
@@ -89,7 +104,7 @@ class QlikScriptExtractor:
             return script[:match.start()]
         return script
 
-    def extract_sql_sources(self, script: str):
+    def extract_sql_sources(self, script: str, *, include_variables=False):
         script = self.clean_script(script)
         sources = []
 
@@ -100,8 +115,14 @@ class QlikScriptExtractor:
             r"(?:SQL\s+)?SELECT\b((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
+        connections = iter(re.finditer(
+            r"(?im)^[^\S\r\n]*(?:LIB\s+)?CONNECT\s+TO\s+([^;]+);", script
+        ))
+        next_connection = next(connections, None) if include_variables else None
+        connection_variables = ()
         for match in re.finditer(pattern, script, re.IGNORECASE | re.DOTALL):
-            table_name = match.group(1)
+            raw_table = match.group(1)
+            table_name = raw_table
             sql_query = match.group(2)
 
             sql_tables = re.findall(
@@ -115,6 +136,10 @@ class QlikScriptExtractor:
             elif sql_tables:
                 table_name = self.resolver.resolve(sql_tables[0], match.start())    
 
+            while next_connection is not None and next_connection.start() < match.start():
+                connection_variables = self._path_variables(next_connection.group(1), next_connection.start())
+                next_connection = next(connections, None)
+
             for source in sql_tables:
                 sources.append({
                     "table": table_name,
@@ -122,10 +147,16 @@ class QlikScriptExtractor:
                     "source": self.resolver.resolve(source, match.start()),
                     "where": self._resolve_where(sql_query, match.start()),
                 })
+                if include_variables:
+                    table_variables = re.findall(r"\$\(([A-Za-z_]\w*)\)", raw_table or "")
+                    variables = connection_variables + self._path_variables(
+                        source, match.start(), table_variables
+                    )
+                    sources[-1]["variables"] = tuple(dict.fromkeys(variables))
 
         return sources
 
-    def extract_file_sources(self, script: str):
+    def extract_file_sources(self, script: str, *, include_variables=False):
         script = self.clean_script(script)
         sources = []
 
@@ -150,6 +181,8 @@ class QlikScriptExtractor:
                 "source": self.resolver.resolve(raw_path,match.start()),
                 "where": self._resolve_where(match.group(4), match.start()),
             })
+            if include_variables:
+                sources[-1]["variables"] = self._path_variables(raw_path, match.start())
 
         return sources
 
@@ -202,7 +235,7 @@ class QlikScriptExtractor:
                 })
         return templates
 
-    def build_table_inventory(self, script):
+    def build_table_inventory(self, script, *, include_variables=False):
         inventory = {}
         # Le STORE global sert de modèle de sortie, même après EXIT SCRIPT.
         full_script = self.clean_script(script)
@@ -211,9 +244,9 @@ class QlikScriptExtractor:
 
         self.resolver.extract_set_variables(script)
 
-        sql_sources = self.extract_sql_sources(script)
-        file_sources = self.extract_file_sources(script)
-        stores = self.extract_stores(script)
+        sql_sources = self.extract_sql_sources(script, include_variables=include_variables)
+        file_sources = self.extract_file_sources(script, include_variables=include_variables)
+        stores = self.extract_stores(script, include_variables=include_variables)
 
         # 1. Ajouter les sources
         for source in sql_sources + file_sources:
@@ -229,6 +262,8 @@ class QlikScriptExtractor:
                 "name": source["source"],
                 "where": source["where"],
             }
+            if include_variables:
+                source_info["variables"] = source["variables"]
 
             if source_info not in inventory[table_name]["sources"]:
                 inventory[table_name]["sources"].append(source_info)
@@ -256,6 +291,8 @@ class QlikScriptExtractor:
             inventory[table_name]["outputs"].append(
                 store["output_file"]
             )
+            if include_variables:
+                inventory[table_name].setdefault("output_variables", []).extend(store["variables"])
 
         # 3. Compléter uniquement les tables sans sortie explicite.
         for table_name, details in inventory.items():
@@ -263,6 +300,11 @@ class QlikScriptExtractor:
                 continue
             for template in templates:
                 path = template['path'].replace(template['variable'], table_name)
+                if include_variables:
+                    variables = self._path_variables(
+                        template["path"], template["position"], (template["variable"][2:-1],)
+                    )
+                    details.setdefault("output_variables", []).extend(variables)
                 path = self.resolver.resolve(path, template['position'])
                 if path not in details['outputs']:
                     details['outputs'].append(path)
