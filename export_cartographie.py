@@ -1,4 +1,4 @@
-"""Export Qlik source and destination variables to Excel."""
+"""Export Qlik path variables and table lineage to Excel."""
 
 import argparse
 import codecs
@@ -13,6 +13,7 @@ HEADERS = (
     "Application", "Input", "Valeur_variable_input", "output", "Valeur_variable_output",
 )
 EMPTY_VARIABLE = (None, None)
+TABLE_HEADERS = ("Application", "Table_source", "table_sortie", "Source", "where", "output")
 
 
 def read_script(path):
@@ -25,9 +26,14 @@ def read_script(path):
         return data.decode("cp1252")
 
 
-def application_rows(path):
+def script_inventory(path):
     extractor = QlikScriptExtractor(VariableResolver())
-    inventory = extractor.build_table_inventory(read_script(path), include_variables=True)
+    return extractor.build_table_inventory(read_script(path), include_variables=True)
+
+
+def application_rows(path, inventory=None):
+    if inventory is None:
+        inventory = script_inventory(path)
     pairs = {}
     application_inputs = {}
     application_outputs = {}
@@ -62,6 +68,35 @@ def application_rows(path):
         yield (path.stem, *input_variable, *output_variable)
 
 
+def table_rows(application, inventory):
+    rows = {}
+    for table, details in inventory.items():
+        output_names = dict.fromkeys(name for name, _ in details.get("output_variables", ()))
+        for source in details["sources"]:
+            if source["type"] == "SQL":
+                source_table = source["name"]
+                file_sources = (None,)
+            elif source["type"] == "FILE":
+                source_table = None
+                file_sources = dict.fromkeys(name for name, _ in source["variables"])
+                file_sources = file_sources or (source["name"],)
+            else:
+                continue
+            for file_source, output_name in product(file_sources, output_names or (None,)):
+                rows[(application, source_table, table, file_source, source["where"], output_name)] = None
+        if not details["sources"]:
+            for output_name in output_names or (None,):
+                rows[(application, None, table, None, None, output_name)] = None
+    yield from rows
+
+
+def append_text_row(sheet, row):
+    sheet.append(row)
+    for cell in sheet[sheet.max_row]:
+        if cell.value is not None:
+            cell.data_type = "s"
+
+
 def export_workbook(scripts, destination):
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
@@ -69,19 +104,21 @@ def export_workbook(scripts, destination):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Variables"
-    workbook.create_sheet("Feuille 2")
+    tables = workbook.create_sheet("Feuille 2")
     sheet.append(HEADERS)
+    tables.append(TABLE_HEADERS)
     for script in scripts:
-        for row in application_rows(script):
-            sheet.append(row)
-            for cell in sheet[sheet.max_row]:
-                if cell.value is not None:
-                    cell.data_type = "s"
+        inventory = script_inventory(script)
+        for row in application_rows(script, inventory):
+            append_text_row(sheet, row)
+        for row in table_rows(script.stem, inventory):
+            append_text_row(tables, row)
 
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
-    for index, width in enumerate((42, 24, 55, 24, 55), start=1):
-        sheet.column_dimensions[get_column_letter(index)].width = width
+    for worksheet, widths in ((sheet, (42, 24, 55, 24, 55)), (tables, (42, 40, 40, 55, 70, 24))):
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for index, width in enumerate(widths, start=1):
+            worksheet.column_dimensions[get_column_letter(index)].width = width
     workbook.save(destination)
     return sheet.max_row - 1
 

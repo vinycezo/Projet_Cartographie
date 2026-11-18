@@ -88,7 +88,14 @@ class QlikScriptExtractor:
             })
             if include_variables:
                 table_variables = re.findall(r"\$\(([A-Za-z_]\w*)\)", raw_table)
-                stores[-1]["variables"] = self._path_variables(raw_path, match.start(), table_variables)
+                *directories, filename = re.split(r"[/\\]", raw_path)
+                filename_variables = re.findall(r"\$\(([A-Za-z_]\w*)\)", filename)
+                variables = self._path_variables(raw_path, match.start(), table_variables)
+                stores[-1]["variables"] = tuple(
+                    (name, value) for name, value in variables
+                    if name not in filename_variables or value != table_name
+                    or any(f"$({name})" in directory for directory in directories)
+                )
 
         return stores
 
@@ -111,7 +118,7 @@ class QlikScriptExtractor:
         pattern = (
             r"(?im)^\s*"
             rf"(?:({self.IDENTIFIER})\s*:\s*)?"
-            r"LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*?;?\s*"
+            r"(?:LOAD\b(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*?;?\s*)?"
             r"(?:SQL\s+)?SELECT\b((?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|[^;'\"])*);"
         )
 
@@ -149,6 +156,9 @@ class QlikScriptExtractor:
                 })
                 if include_variables:
                     table_variables = re.findall(r"\$\(([A-Za-z_]\w*)\)", raw_table or "")
+                    table_variables.extend(re.findall(
+                        r"(?:^|\.)\$\(([A-Za-z_]\w*)\)$", source.strip("[]")
+                    ))
                     variables = connection_variables + self._path_variables(
                         source, match.start(), table_variables
                     )
